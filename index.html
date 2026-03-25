@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D Highway Master</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; touch-action: none; font-family: 'Arial', sans-serif; }
+        #ui {
+            position: absolute; top: 25px; left: 25px; color: white;
+            font-size: 24px; font-weight: bold; z-index: 10; pointer-events: none;
+            text-shadow: 2px 2px 5px rgba(0,0,0,0.9);
+        }
+        #restartBtn {
+            display: none; position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%); padding: 20px 40px;
+            font-size: 28px; background: #ff4444; color: white; border: none; 
+            border-radius: 15px; z-index: 20; cursor: pointer; box-shadow: 0 0 15px rgba(255,0,0,0.5);
+        }
+        #touch-left, #touch-right { position: absolute; top: 0; width: 50%; height: 100%; z-index: 5; }
+        #touch-right { right: 0; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">ЖИЗНИ: <span id="lives">2</span> | СЧЁТ: <span id="score">0</span></div>
+    <button id="restartBtn" onclick="location.reload()">ПОПРОБОВАТЬ СНОВА</button>
+    
+    <div id="touch-left"></div>
+    <div id="touch-right"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+    <script>
+        let scene, camera, renderer, playerCar, sun, ambientLight, road;
+        let lives = 2, score = 0, isGameOver = false;
+        let obstacles = [];
+        let rainParticles;
+        
+        const speed = 0.8; 
+        const roadWidth = 10;
+        const laneWidth = roadWidth / 3;
+
+        // Состояния для физики и окружения
+        let targetX = 0;
+        let timeCycle = 0; 
+        let weatherTime = 0;
+        let rainTargetOpacity = 0;
+        let shakeTime = 0;
+        const originalCamPos = new THREE.Vector3(0, 4, 7);
+
+        // Звук
+        const listener = new THREE.AudioListener();
+        const audioLoader = new THREE.AudioLoader();
+        const sounds = {};
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1500);
+            camera.position.copy(originalCamPos);
+            camera.lookAt(0, 0, -5);
+            camera.add(listener);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            // Свет
+            sun = new THREE.DirectionalLight(0xffffff, 1.2);
+            sun.position.set(10, 20, 10);
+            scene.add(sun);
+            ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            loadAssets();
+            setupControls();
+            createEnvironment();
+            createRain();
+            animate();
+            spawnLoop();
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function loadAssets() {
+            const loader = new THREE.GLTFLoader();
+            loader.load('models/dirty_car_061220.glb', (gltf) => {
+                playerCar = gltf.scene;
+                playerCar.scale.set(0.6, 0.6, 0.6);
+                playerCar.rotation.y = Math.PI;
+                playerCar.position.y = 0.3;
+                scene.add(playerCar);
+            });
+
+            loadSound('engine', 'sounds/engine.mp3', true, 0.25);
+            loadSound('hit_enemy', 'sounds/enemy_hit.mp3', false, 0.9);
+            loadSound('hit_friend', 'sounds/friend_hit.mp3', false, 0.9);
+        }
+
+        function loadSound(name, path, loop, vol) {
+            const s = new THREE.Audio(listener);
+            audioLoader.load(path, (buffer) => {
+                s.setBuffer(buffer); s.setLoop(loop); s.setVolume(vol);
+                sounds[name] = s;
+                if(name === 'engine') s.play();
+            }, undefined, (err) => console.log("Файл звука не найден: " + path));
+        }
+
+        function createEnvironment() {
+            const texLoader = new THREE.TextureLoader();
+            
+            // Дорога (без просветов)
+            const roadTex = texLoader.load('models/grey-speckled-texture_1375194-6389.jpg');
+            roadTex.wrapS = roadTex.wrapT = THREE.RepeatWrapping;
+            roadTex.repeat.set(1, 150);
+            road = new THREE.Mesh(new THREE.PlaneGeometry(roadWidth, 3000), new THREE.MeshLambertMaterial({ map: roadTex }));
+            road.rotation.x = -Math.PI / 2;
+            road.position.z = -1450;
+            scene.add(road);
+
+            // Здания
+            const bldgTex = texLoader.load('models/i.jpeg');
+            bldgTex.wrapS = bldgTex.wrapT = THREE.RepeatWrapping;
+            bldgTex.repeat.set(1, 100);
+            const bldgGeo = new THREE.BoxGeometry(15, 50, 3000);
+            const bldgMat = new THREE.MeshLambertMaterial({ map: bldgTex });
+
+            const leftB = new THREE.Mesh(bldgGeo, bldgMat);
+            leftB.position.set(-12.5, 24.8, -1450); 
+            scene.add(leftB);
+
+            const rightB = new THREE.Mesh(bldgGeo, bldgMat);
+            rightB.position.set(12.5, 24.8, -1450);
+            scene.add(rightB);
+        }
+
+        function createRain() {
+            const rainGeo = new THREE.BufferGeometry();
+            const rainCount = 2500;
+            const pos = new Float32Array(rainCount * 3);
+            for(let i=0; i < rainCount * 3; i+=3) {
+                pos[i] = (Math.random() - 0.5) * 50; 
+                pos[i+1] = Math.random() * 30;       
+                pos[i+2] = (Math.random() - 0.5) * 50;
+            }
+            rainGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            const rainMat = new THREE.PointsMaterial({ color: 0xaaaaaa, size: 0.12, transparent: true, opacity: 0 });
+            rainParticles = new THREE.Points(rainGeo, rainMat);
+            scene.add(rainParticles);
+        }
+
+        function setupControls() {
+            const move = (dir) => {
+                targetX += dir * laneWidth;
+                targetX = THREE.MathUtils.clamp(targetX, -laneWidth, laneWidth);
+            };
+            document.getElementById('touch-left').addEventListener('touchstart', (e) => { e.preventDefault(); move(-1); });
+            document.getElementById('touch-right').addEventListener('touchstart', (e) => { e.preventDefault(); move(1); });
+            window.addEventListener('keydown', (e) => {
+                if(e.code === "ArrowLeft" || e.code === "KeyA") move(-1);
+                if(e.code === "ArrowRight" || e.code === "KeyD") move(1);
+            });
+        }
+
+        function spawnObstacle() {
+            if(isGameOver) return;
+            const isEnemy = Math.random() > 0.4;
+            const tex = new THREE.TextureLoader().load(isEnemy ? 'models/InShot_20260324_120003547.png' : 'models/InShot_20260325_150717238.png');
+            const obj = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.6, 0.1), new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
+            
+            obj.position.set((Math.floor(Math.random()*3)-1)*laneWidth, 0.8, -70);
+            obj.userData = { hit: false, type: isEnemy ? 'enemy' : 'friend', vY: 0, vX: 0, vR: 0 };
+            scene.add(obj);
+            obstacles.push(obj);
+            setTimeout(spawnLoop, 1000 + Math.random() * 500);
+        }
+        function spawnLoop() { spawnObstacle(); }
+
+        function animate() {
+            if(isGameOver) return;
+            requestAnimationFrame(animate);
+
+            // 1. ДЕНЬ И НОЧЬ
+            timeCycle += 0.002;
+            const dayLevel = (Math.sin(timeCycle) + 1) / 2; 
+            scene.background = new THREE.Color().setHSL(0.6, 0.4, dayLevel * 0.4 + 0.05);
+            sun.intensity = dayLevel * 1.3;
+            ambientLight.intensity = dayLevel * 0.4 + 0.1;
+
+            // 2. ДИНАМИЧЕСКИЙ ДОЖДЬ
+            weatherTime += 0.0015;
+            rainTargetOpacity = Math.sin(weatherTime) > 0.3 ? 0.6 : 0;
+            rainParticles.material.opacity = THREE.MathUtils.lerp(rainParticles.material.opacity, rainTargetOpacity, 0.01);
+            
+            if(rainParticles.material.opacity > 0.01) {
+                const attr = rainParticles.geometry.attributes.position;
+                for(let i=1; i < attr.array.length; i+=3) {
+                    attr.array[i] -= 0.7; 
+                    if(attr.array[i] < 0) attr.array[i] = 30;
+                }
+                attr.needsUpdate = true;
+            }
+            rainParticles.position.z = camera.position.z - 20;
+
+            // 3. ФИЗИКА ИГРОКА И КАМЕРЫ
+            if(playerCar) {
+                playerCar.position.x = THREE.MathUtils.lerp(playerCar.position.x, targetX, 0.12);
+                playerCar.rotation.z = THREE.MathUtils.lerp(playerCar.rotation.z, (targetX - playerCar.position.x) * 0.25, 0.1);
+            }
+            if(shakeTime > 0) {
+                camera.position.x = originalCamPos.x + (Math.random()-0.5)*0.6;
+                camera.position.y = originalCamPos.y + (Math.random()-0.5)*0.6;
+                shakeTime -= 0.02;
+            } else {
+                camera.position.lerp(originalCamPos, 0.1);
+            }
+
+            if(road) road.material.map.offset.y -= 0.05;
+
+            // 4. ПРЕПЯТСТВИЯ
+            obstacles.forEach((obj, idx) => {
+                if(!obj.userData.hit) {
+                    obj.position.z += speed;
+                    if(playerCar && obj.position.distanceTo(playerCar.position) < 1.4) {
+                        obj.userData.hit = true;
+                        if(obj.userData.type === 'enemy') {
+                            score += 10;
+                            if(sounds.hit_enemy) { sounds.hit_enemy.stop(); sounds.hit_enemy.play(); }
+                            obj.userData.vY = 0.6; obj.userData.vX = (Math.random()-0.5); obj.userData.vR = 0.3;
+                        } else {
+                            lives--; shakeTime = 0.3;
+                            if(navigator.vibrate) navigator.vibrate(100);
+                            if(sounds.hit_friend) { sounds.hit_friend.stop(); sounds.hit_friend.play(); }
+                            if(lives <= 0) endGame();
+                        }
+                        document.getElementById('score').innerText = score;
+                        document.getElementById('lives').innerText = lives;
+                    }
+                } else {
+                    obj.position.y += obj.userData.vY; obj.position.x += obj.userData.vX; obj.position.z -= 0.3;
+                    obj.rotation.z += obj.userData.vR; obj.userData.vY -= 0.03;
+                }
+                if(obj.position.z > 15 || obj.position.y < -5) {
+                    scene.remove(obj); obstacles.splice(idx, 1);
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        function endGame() {
+            isGameOver = true;
+            document.getElementById('restartBtn').style.display = 'block';
+            if(sounds.engine) sounds.engine.stop();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
